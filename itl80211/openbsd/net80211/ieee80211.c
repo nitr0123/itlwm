@@ -1594,3 +1594,15 @@ ieee80211_plcp2rate(u_int8_t plcp, enum ieee80211_phymode mode)
     
     return 0;
 }
+
+#ifdef AIRPORT_WCL
+#include <kern/clock.h>
+uint64_t
+ieee80211_wcl_now_ms(void)
+{
+    uint64_t abs, ns;
+    clock_get_uptime(&abs);
+    absolutetime_to_nanoseconds(abs, &ns);
+    return ns / 1000000;
+}
+#endif

@@ -2714,6 +2714,7 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
     u_int16_t capinfo, status, associd;
     u_int8_t rate;
     
+    WCL_TRACE(ic, "assoc resp rx (state %d)", ic->ic_state);
     if (ic->ic_opmode != IEEE80211_M_STA ||
         ic->ic_state != IEEE80211_S_ASSOC) {
         ic->ic_stats.is_rx_mgtdiscard++;

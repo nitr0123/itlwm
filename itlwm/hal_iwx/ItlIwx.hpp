@@ -421,6 +421,9 @@ public:
     void    iwx_del_task(struct iwx_softc *, struct taskq *, struct task *);
     int    iwx_scan(struct iwx_softc *);
     static int    iwx_bgscan(struct ieee80211com *);
+#ifdef AIRPORT_WCL
+    static void   iwx_wcl_expedite_join(struct ieee80211com *);
+#endif
     int    iwx_umac_scan_abort(struct iwx_softc *);
     int    iwx_scan_abort(struct iwx_softc *);
     int    iwx_rs_rval2idx(uint8_t);

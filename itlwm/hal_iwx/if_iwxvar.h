@@ -687,6 +687,8 @@ struct iwx_softc {
 
 	int sc_intmask;
 	int sc_flags;
+	/* A full scan was aborted for a WCL join; rescan when the abort completes. */
+	bool sc_wcl_rescan_after_abort;
 
 	uint32_t sc_fh_init_mask;
 	uint32_t sc_hw_init_mask;

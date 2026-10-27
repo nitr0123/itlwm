@@ -454,6 +454,24 @@ inline bool scanChannelSelected(const uint8_t *channels, bool restricted, unsign
     return !restricted || (channel < 256 && (channels[channel / 8] & (1U << (channel % 8))));
 }
 
+// Channel filter for HAL scans: a WCL scan uses its own channel list; a scan
+// made for a WCL join only visits the target BSS's channel when one is known.
+inline bool scanChannelWanted(const uint8_t *channels, bool wclScan, bool wclRestricted,
+                              bool joining, unsigned joinChannel, unsigned channel) {
+    if (wclScan)
+        return scanChannelSelected(channels, wclRestricted, channel);
+    if (joining && joinChannel)
+        return channel == joinChannel;
+    return true;
+}
+
+// The channel number in a WCL join's channel spec (low byte, as published in
+// BeaconMetadata::channelSpec), or 0 when it is not a plausible channel.
+inline unsigned joinChannel(uint16_t channelSpec) {
+    unsigned channel = channelSpec & 0xff;
+    return channel >= 1 && channel <= 196 ? channel : 0;
+}
+
 inline bool decodeScan(const void *buffer, size_t length, ScanRequest &out) {
     if (!buffer || length < 0x58)
         return false;

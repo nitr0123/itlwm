@@ -449,6 +449,11 @@ struct ieee80211com {
     bool ic_wcl_scan_restricted;
     uint8_t ic_wcl_scan_channels[32];
     uint32_t ic_wcl_scan_away_time_ms;
+    /* Channel of the BSS a WCL join targets (0 = scan everything). */
+    uint8_t ic_wcl_join_channel;
+    uint64_t ic_wcl_join_start_ms;
+    /* Optional HAL hook: abort a running full scan so a join can rescan. */
+    void (*ic_wcl_expedite_join)(struct ieee80211com *);
     uint64_t ic_wcl_tx_packets[4];
     uint64_t ic_wcl_rx_packets[4];
 #endif
@@ -742,5 +747,17 @@ struct ieee80211_ess *ieee80211_get_ess(struct ieee80211com *, const char *, int
 void ieee80211_begin_cache_bgscan(struct _ifnet *);
 
 extern	int ieee80211_cache_size;
+
+#ifdef AIRPORT_WCL
+uint64_t ieee80211_wcl_now_ms(void);
+/* Join timing trace, visible with log show (eventMessage CONTAINS "itlwm-wcl"). */
+#define WCL_TRACE(ic, fmt, ...) do {                                         \
+    if ((ic)->ic_wcl_join_requested)                                         \
+        IOLog("itlwm-wcl: " fmt " at %llu ms\n", ##__VA_ARGS__,             \
+              ieee80211_wcl_now_ms() - (ic)->ic_wcl_join_start_ms);          \
+} while (0)
+#else
+#define WCL_TRACE(ic, fmt, ...) do { } while (0)
+#endif
 
 #endif /* _NET80211_IEEE80211_VAR_H_ */

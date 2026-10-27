@@ -1456,6 +1456,12 @@ ieee80211_end_scan(struct _ifnet *ifp)
     if (ni == NULL) {
         DPRINTF(("no scan candidate\n"));
     notfound:
+#ifdef AIRPORT_WCL
+        WCL_TRACE(ic, "scan found no matching BSS (join channel %u)", ic->ic_wcl_join_channel);
+        /* The target was not on its advertised channel: scan everything next. */
+        if (!bgscan && ic->ic_wcl_join_requested)
+            ic->ic_wcl_join_channel = 0;
+#endif
         
 #ifndef IEEE80211_STA_ONLY
         if (ic->ic_opmode == IEEE80211_M_IBSS &&
@@ -1571,6 +1577,8 @@ ieee80211_end_scan(struct _ifnet *ifp)
     } else if (selbs == NULL)
         goto notfound;
     
+    WCL_TRACE(ic, "scan selected %s on channel %u rssi %d", ether_sprintf(selbs->ni_bssid),
+              ieee80211_chan2ieee(ic, selbs->ni_chan), selbs->ni_rssi);
     ieee80211_node_join_bss(ic, selbs);
 }
 

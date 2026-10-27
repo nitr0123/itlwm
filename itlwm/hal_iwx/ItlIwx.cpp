@@ -7684,8 +7684,9 @@ iwx_umac_scan_fill_channels(struct iwx_softc *sc,
         if (c->ic_flags == 0)
             continue;
 #ifdef AIRPORT_WCL
-        if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
-                ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted,
+        if (!AirportWCL::scanChannelWanted(ic->ic_wcl_scan_channels,
+                ic->ic_wcl_scan_requested, ic->ic_wcl_scan_restricted,
+                ic->ic_wcl_join_requested, ic->ic_wcl_join_channel,
                 ieee80211_chan2ieee(ic, c)))
             continue;
 #endif
@@ -7717,6 +7718,8 @@ iwx_umac_scan_fill_channels(struct iwx_softc *sc,
         nchan++;
     }
     
+    WCL_TRACE(ic, "scan request: %u channel(s), join channel %u, bg=%d", nchan,
+              ic->ic_wcl_scan_requested ? 0 : ic->ic_wcl_join_channel, bgscan);
     return nchan;
 }
 
@@ -9667,6 +9670,8 @@ iwx_auth(struct iwx_softc *sc)
     int generation = sc->sc_generation, err = 0;
     
     splassert(IPL_NET);
+    WCL_TRACE(ic, "iwx_auth: firmware context setup on channel %u",
+              ieee80211_chan2ieee(ic, in->in_ni.ni_chan));
     
     in->in_ni.ni_chw = IEEE80211_CHAN_WIDTH_20_NOHT;
     in->in_ni.ni_flags &= ~(IEEE80211_NODE_HT |
@@ -9753,6 +9758,7 @@ iwx_auth(struct iwx_softc *sc)
         err = iwx_schedule_protect_session(sc, in, duration);
     else
         iwx_protect_session(sc, in, duration, in->in_ni.ni_intval / 2);
+    WCL_TRACE(ic, "iwx_auth: session protection scheduled (err %d)", err);
     
     return err;
     
@@ -10295,12 +10301,55 @@ iwx_endscan(struct iwx_softc *sc)
 //        XYLog("%s scan_result ssid=%s, bssid=%s, ni_rsnciphers=%d, ni_rsncipher=%d, ni_rsngroupmgmtcipher=%d, ni_rsngroupcipher=%d, ni_rssi=%d,  ni_capinfo=%d, ni_intval=%d, ni_rsnakms=%d, ni_supported_rsnakms=%d, ni_rsnprotos=%d, ni_supported_rsnprotos=%d, ni_rstamp=%d\n", __FUNCTION__, ni->ni_essid, ether_sprintf(ni->ni_bssid), ni->ni_rsnciphers, ni->ni_rsncipher, ni->ni_rsngroupmgmtcipher, ni->ni_rsngroupcipher, ni->ni_rssi, ni->ni_capinfo, ni->ni_intval, ni->ni_rsnakms, ni->ni_supported_rsnakms, ni->ni_rsnprotos, ni->ni_supported_rsnprotos, ni->ni_rstamp);
 //    }
     
-    if ((sc->sc_flags & (IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN)) == 0)
+    if ((sc->sc_flags & (IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN)) == 0) {
+#ifdef AIRPORT_WCL
+        /* Completion of a scan aborted for a WCL join: start the join scan now. */
+        if (sc->sc_wcl_rescan_after_abort) {
+            sc->sc_wcl_rescan_after_abort = false;
+            if (ic->ic_state == IEEE80211_S_SCAN && ic->ic_wcl_join_requested) {
+                WCL_TRACE(ic, "aborted scan completed, starting join scan");
+                ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+            }
+        }
+#endif
         return;
+    }
     
     sc->sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
+    WCL_TRACE(ic, "scan complete");
     ieee80211_end_scan(&ic->ic_if);
 }
+
+#ifdef AIRPORT_WCL
+/*
+ * A WCL join arrived while a full foreground scan (e.g. the one iwx_init
+ * starts after a firmware restart) is running. That scan visits every 2.4 and
+ * 5 GHz channel, DFS ones passively, and takes ~7 s, most of airportd's 10 s
+ * association budget. Abort it; iwx_endscan() starts the join scan, limited to
+ * the target channel, once the firmware confirms the abort.
+ */
+void ItlIwx::
+iwx_wcl_expedite_join(struct ieee80211com *ic)
+{
+    struct iwx_softc *sc = (struct iwx_softc *)IC2IFP(ic)->if_softc;
+    ItlIwx *that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_wcl_expedite_join((struct ieee80211com *)arg0);
+                return kIOReturnSuccess;
+            }, ic);
+        return;
+    }
+    if (ic->ic_state != IEEE80211_S_SCAN ||
+        (sc->sc_flags & (IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN)) != IWX_FLAG_SCANNING)
+        return;
+    int err = that->iwx_scan_abort(sc);
+    WCL_TRACE(ic, "aborting running full scan for join (err %d)", err);
+    if (err == 0)
+        sc->sc_wcl_rescan_after_abort = true;
+}
+#endif
 
 /*
  * Aging and idle timeouts for the different possible scenarios
@@ -13710,6 +13759,9 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     
     ic->ic_node_alloc = iwx_node_alloc;
     ic->ic_bgscan_start = iwx_bgscan;
+#ifdef AIRPORT_WCL
+    ic->ic_wcl_expedite_join = iwx_wcl_expedite_join;
+#endif
     ic->ic_set_key = iwx_set_key;
     ic->ic_delete_key = iwx_delete_key;
     

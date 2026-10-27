@@ -781,6 +781,8 @@ setASSOCIATE(struct apple80211_assoc_data *ad)
 
     if (!ad)
         return kIOReturnError;
+    IOLog("itlwm-wcl: legacy setASSOCIATE (not WCL) lower=%d upper=0x%x state=%d\n",
+          ad->ad_auth_lower, ad->ad_auth_upper, ic->ic_state);
     
     if (ic->ic_state < IEEE80211_S_SCAN)
         return kIOReturnSuccess;

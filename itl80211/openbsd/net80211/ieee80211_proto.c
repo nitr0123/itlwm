@@ -1223,6 +1223,7 @@ ieee80211_auth_open(struct ieee80211com *ic, const struct ieee80211_frame *wh,
 #endif	/* IEEE80211_STA_ONLY */
 
 	case IEEE80211_M_STA:
+		WCL_TRACE(ic, "auth rx seq %u status %u (state %d)", seq, status, ic->ic_state);
 		if (ic->ic_state != IEEE80211_S_AUTH ||
 		    seq != IEEE80211_AUTH_OPEN_RESPONSE) {
 			ic->ic_stats.is_rx_bad_auth++;
@@ -1498,6 +1499,7 @@ justcleanup:
 				    ieee80211_state_name[nstate]);
 			break;
 		case IEEE80211_S_SCAN:
+			WCL_TRACE(ic, "auth tx (open, seq 1)");
 			IEEE80211_SEND_MGMT(ic, ni,
 			    IEEE80211_FC0_SUBTYPE_AUTH, 1);
 			break;
@@ -1506,6 +1508,7 @@ justcleanup:
 			switch (mgt) {
 			case IEEE80211_FC0_SUBTYPE_AUTH:
 				if (ic->ic_opmode == IEEE80211_M_STA) {
+					WCL_TRACE(ic, "auth tx (retry)");
 					IEEE80211_SEND_MGMT(ic, ni,
 					    IEEE80211_FC0_SUBTYPE_AUTH,
 					    IEEE80211_AUTH_OPEN_REQUEST);
@@ -1547,6 +1550,7 @@ justcleanup:
 				    ieee80211_state_name[nstate]);
 			break;
 		case IEEE80211_S_AUTH:
+			WCL_TRACE(ic, "assoc req tx");
 			IEEE80211_SEND_MGMT(ic, ni,
 			    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 0);
 			break;

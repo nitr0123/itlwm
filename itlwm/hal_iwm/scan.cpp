@@ -177,8 +177,9 @@ iwm_lmac_scan_fill_channels(struct iwm_softc *sc,
         if (c->ic_flags == 0)
             continue;
 #ifdef AIRPORT_WCL
-        if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
-                ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted,
+        if (!AirportWCL::scanChannelWanted(ic->ic_wcl_scan_channels,
+                ic->ic_wcl_scan_requested, ic->ic_wcl_scan_restricted,
+                ic->ic_wcl_join_requested, ic->ic_wcl_join_channel,
                 ieee80211_chan2ieee(ic, c)))
             continue;
 #endif
@@ -216,8 +217,9 @@ iwm_umac_scan_fill_channels(struct iwm_softc *sc,
         if (c->ic_flags == 0)
             continue;
 #ifdef AIRPORT_WCL
-        if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
-                ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted,
+        if (!AirportWCL::scanChannelWanted(ic->ic_wcl_scan_channels,
+                ic->ic_wcl_scan_requested, ic->ic_wcl_scan_restricted,
+                ic->ic_wcl_join_requested, ic->ic_wcl_join_channel,
                 ieee80211_chan2ieee(ic, c)))
             continue;
 #endif
