@@ -331,13 +331,48 @@ inline bool scanUsesProbes(bool requested, bool activeRequest) {
     return requested ? activeRequest : true;
 }
 
+// AKM suite types (00-0f-ac:N) of the SAE family. itlwm cannot run SAE yet,
+// so a transition network that offers one of these next to PSK is shown to
+// WCL as WPA2-PSK only.
+inline bool isSAEFamilyAKM(uint8_t type) {
+    return type == 8 ||   // SAE
+           type == 9 ||   // FT-SAE
+           type == 24 ||  // SAE-EXT-KEY (H2E, group > 19)
+           type == 25;    // FT-SAE-EXT-KEY
+}
+
+// AKMs that may accompany PSK + SAE on a transition network and are safe to
+// drop from the scan copy because PSK covers them (FT-PSK, PSK-SHA256).
+inline bool isDroppablePSKVariant(uint8_t type) {
+    return type == 4 || type == 6;
+}
+
+// Remove every element with the given id. Returns the new length.
+inline size_t stripElement(uint8_t *ies, size_t length, uint8_t id) {
+    for (size_t offset = 0; offset + 2 <= length; ) {
+        size_t size = size_t(ies[offset + 1]) + 2;
+        if (offset + size > length)
+            break;
+        if (ies[offset] == id) {
+            memmove(ies + offset, ies + offset + size, length - offset - size);
+            length -= size;
+            continue;
+        }
+        offset += size;
+    }
+    return length;
+}
+
 // Present the supported PSK option of a PSK/SAE transition network to WCL.
 // This operates on the scan-message copy, never the received beacon or the
 // net80211 RSN IE used to validate the four-way handshake. SAE-only, mandatory
 // PMF and other AKM combinations must not be converted into WPA2 networks.
+// When a rewrite happens the RSNXE (244, SAE H2E / PK capabilities) is removed
+// too, so WCL has no reason to attempt SAE-H2E on that BSS.
 inline size_t selectWPA2TransitionMode(uint8_t *ies, size_t length) {
     if (!validIEs(ies, length))
         return length;
+    bool rewritten = false;
     for (size_t offset = 0; offset < length; ) {
         uint8_t *ie = ies + offset;
         size_t size = size_t(ie[1]) + 2;
@@ -374,9 +409,9 @@ inline size_t selectWPA2TransitionMode(uint8_t *ies, size_t length) {
                 other = true;
             else if (suite[3] == 2)
                 psk = true;
-            else if (suite[3] == 8)
+            else if (isSAEFamilyAKM(suite[3]))
                 sae = true;
-            else
+            else if (!isDroppablePSKVariant(suite[3]))
                 other = true;
         }
         if (!psk || !sae || other) {
@@ -395,7 +430,10 @@ inline size_t selectWPA2TransitionMode(uint8_t *ies, size_t length) {
         ie[1] -= removed;
         length -= removed;
         offset += size - removed;
+        rewritten = true;
     }
+    if (rewritten)
+        length = stripElement(ies, length, 244);
     return length;
 }
 inline bool probeChannel(bool active, bool passiveOnly, bool dfs) {
@@ -454,7 +492,8 @@ struct JoinRequest {
     uint32_t keyLength;
     uint32_t keyCipher;
     uint16_t keyIndex;
-    uint8_t key[32];
+    // 32 bytes for a PMK; up to 64 for an SAE password (APPLE80211_CIPHER_PWD).
+    uint8_t key[64];
     uint8_t bssid[6];
     uint16_t channelSpec;
     uint16_t rsnLength;
@@ -478,7 +517,62 @@ inline bool validRSNOverride(const uint8_t *ie, size_t length) {
         ie[4] == 0xf2 && ie[5] == 1 && ie[6] == 1 && ie[7] == 0;
 }
 
+// apple80211_authtype_upper bits used below.
+constexpr uint32_t kAuthWPA2PSK = 1u << 3;
+constexpr uint32_t kAuthSHA256PSK = 1u << 10;
+constexpr uint32_t kAuthSAE = (1u << 12) | (1u << 13); // WPA3_SAE, WPA3_FT_SAE
+constexpr uint32_t kCipherPMK = 6, kCipherPMKSA = 7, kCipherPWD = 10;
+
+// WPA3-Personal fallback: itlwm has no SAE yet (see docs plan). When WCL asks
+// for SAE on a BSS that also offers PSK, join it with WPA2-PSK instead.
+//   UsePSK  - the request already carries a PMK; just drop the SAE bits.
+//   NeedPMK - the request carries the SAE password; derive the WPA2 PMK
+//             (PBKDF2-SHA1(password, SSID, 4096)) and drop the SAE bits.
+//   NoPSK   - SAE requested on a BSS without PSK (WPA3-only): unsupported.
+//   Invalid - SAE mixed with enterprise/FT bits or an unusable key.
+enum class SAEFallback { NotSAE, UsePSK, NeedPMK, NoPSK, Invalid };
+inline SAEFallback planSAEFallback(uint32_t upperAuth, uint32_t keyCipher,
+                                   uint32_t keyLength, const uint8_t *key,
+                                   bool bssOffersPSK) {
+    if (!(upperAuth & kAuthSAE))
+        return SAEFallback::NotSAE;
+    if (upperAuth & ~(kAuthSAE | kAuthWPA2PSK | kAuthSHA256PSK))
+        return SAEFallback::Invalid;
+    if (!bssOffersPSK)
+        return SAEFallback::NoPSK;
+    if (keyLength == 32 && (keyCipher == kCipherPMK || keyCipher == kCipherPMKSA))
+        return SAEFallback::UsePSK;
+    // WPA2 passphrases are 8..63 printable ASCII; longer SAE passwords
+    // cannot be used for PSK.
+    if (keyCipher == kCipherPWD && keyLength >= 8 && keyLength <= 63) {
+        for (uint32_t i = 0; i < keyLength; ++i)
+            if (key[i] < 0x20 || key[i] > 0x7e)
+                return SAEFallback::Invalid;
+        return SAEFallback::NeedPMK;
+    }
+    return SAEFallback::Invalid;
+}
+
+inline const char *saeFallbackName(SAEFallback f) {
+    switch (f) {
+        case SAEFallback::NotSAE: return "none";
+        case SAEFallback::UsePSK: return "sae->psk(pmk)";
+        case SAEFallback::NeedPMK: return "sae->psk(pbkdf2)";
+        case SAEFallback::NoPSK: return "sae-only(unsupported)";
+        default: return "invalid";
+    }
+}
+
 enum class LegacyAuth { Invalid, Open, Wep, Personal, Enterprise };
+inline const char *legacyAuthName(LegacyAuth a) {
+    switch (a) {
+        case LegacyAuth::Open: return "open";
+        case LegacyAuth::Wep: return "wep";
+        case LegacyAuth::Personal: return "personal";
+        case LegacyAuth::Enterprise: return "enterprise";
+        default: return "invalid";
+    }
+}
 inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
     // Values from apple80211_authtype/cipher_type, used by the WCL association request.
     if (!validRSNOverride(j.rsn, j.rsnLength)) return LegacyAuth::Invalid;
@@ -510,8 +604,11 @@ inline bool decodeJoin(const void *buffer, size_t length, JoinRequest &out) {
     uint32_t count = read32(p + 0x214), ssidLength = read32(p + 0x1c);
     uint32_t keyLength = read32(p + 0x44);
     uint16_t rsnLength = read16(p + 0xd4);
+    // The apple80211_key buffer at 0x50 holds 64 bytes (key[32] + pad[30] +
+    // alignment); only an SAE password may use more than 32 of them.
     if (!count || count > 10 || !ssidLength || ssidLength > 32 ||
-        keyLength > 32 || rsnLength > 257 || length < 0x218 + size_t(count) * 18)
+        keyLength > 64 || (keyLength > 32 && read32(p + 0x48) != 10) ||
+        rsnLength > 257 || length < 0x218 + size_t(count) * 18)
         return false;
     if (p[0x21c] & 1)
         return false;
