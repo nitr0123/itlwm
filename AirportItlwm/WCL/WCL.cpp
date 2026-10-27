@@ -15,7 +15,63 @@
 #include <net80211/ieee80211_ioctl.h>
 #include <net80211/ieee80211_priv.h>
 
+#include <crypto/sha1.h>
+
 extern IOCommandGate *_fCommandGate;
+
+// Join diagnostics go to IOLog (visible with `log show --predicate
+// 'eventMessage CONTAINS "itlwm-wcl"'`); XYLog only reaches kprintf.
+// Never log key material.
+#define WCLLog(fmt, ...) IOLog("itlwm-wcl: " fmt "\n", ##__VA_ARGS__)
+
+static uint64_t wclNowMs()
+{
+    uint64_t abs, ns;
+    clock_get_uptime(&abs);
+    absolutetime_to_nanoseconds(abs, &ns);
+    return ns / 1000000;
+}
+
+static uint64_t wclJoinStartMs;
+
+// Rewrite an SAE join request into a WPA2-PSK one when the BSS offers PSK.
+// Returns false when the request must be refused.
+static bool applySAEFallback(ieee80211com *ic, AirportWCL::JoinRequest &join)
+{
+    bool known = false, offersPSK = true;
+    if (auto ni = ieee80211_find_node(ic, join.bssid)) {
+        known = true;
+        offersPSK = (ni->ni_rsnakms & (IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK)) != 0;
+    }
+    auto plan = AirportWCL::planSAEFallback(join.upperAuth, join.keyCipher,
+                                            join.keyLength, join.key, offersPSK);
+    if (plan == AirportWCL::SAEFallback::NotSAE)
+        return true;
+    WCLLog("join requests SAE (upper=0x%x cipher=%u keylen=%u bss=%s psk=%d): %s",
+           join.upperAuth, join.keyCipher, join.keyLength, known ? "scanned" : "unknown",
+           offersPSK, AirportWCL::saeFallbackName(plan));
+    if (plan == AirportWCL::SAEFallback::NeedPMK) {
+        char passphrase[64] = {};
+        uint8_t pmk[32];
+        memcpy(passphrase, join.key, join.keyLength);
+        int error = pbkdf2_sha1(passphrase, join.ssid, join.ssidLength, 4096, pmk, sizeof(pmk));
+        explicit_bzero(passphrase, sizeof(passphrase));
+        if (error) {
+            explicit_bzero(pmk, sizeof(pmk));
+            return false;
+        }
+        explicit_bzero(join.key, sizeof(join.key));
+        memcpy(join.key, pmk, sizeof(pmk));
+        explicit_bzero(pmk, sizeof(pmk));
+        join.keyLength = 32;
+        join.keyCipher = AirportWCL::kCipherPMK;
+    } else if (plan != AirportWCL::SAEFallback::UsePSK) {
+        // TODO(wpa3): run SAE here instead (see docs/wpa3-airportitlwm-plan.md).
+        return false;
+    }
+    join.upperAuth = (join.upperAuth & ~AirportWCL::kAuthSAE) | AirportWCL::kAuthWPA2PSK;
+    return true;
+}
 
 struct AirportItlwmSkywalkInterface::CountryUpdate {
     AirportItlwmSkywalkInterface *interface;
@@ -414,7 +470,9 @@ IOReturn AirportItlwmSkywalkInterface::accessWCLRSN(apple80211_rsn_ie_data *data
 IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *request)
 {
     AirportWCL::JoinRequest join;
+    wclJoinStartMs = wclNowMs();
     if (!AirportWCL::decodeJoin(request, 0x2cc, join)) {
+        WCLLog("join request rejected: undecodable (key cipher/length or layout)");
         return kIOReturnBadArgument;
     }
     return startWCLJoin(join);
@@ -422,11 +480,18 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *r
 
 IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
 {
-    auto auth = AirportWCL::classifyLegacyAuth(join);
+    ieee80211com *ic = fHalService->get80211Controller();
+    uint32_t requestedUpper = join.upperAuth, requestedCipher = join.keyCipher;
+    bool saeOK = applySAEFallback(ic, join);
+    auto auth = saeOK ? AirportWCL::classifyLegacyAuth(join) : AirportWCL::LegacyAuth::Invalid;
     bool personal = auth == AirportWCL::LegacyAuth::Personal;
     bool enterprise = auth == AirportWCL::LegacyAuth::Enterprise;
     bool supported = auth != AirportWCL::LegacyAuth::Invalid;
-    ieee80211com *ic = fHalService->get80211Controller();
+    WCLLog("join request lower=%u upper=0x%x->0x%x cipher=%u->%u keylen=%u rsnlen=%u "
+           "auth=%s state=%d macreconfig=%d pending=%d scan=%d",
+           join.lowerAuth, requestedUpper, join.upperAuth, requestedCipher, join.keyCipher,
+           join.keyLength, join.rsnLength, AirportWCL::legacyAuthName(auth), ic->ic_state,
+           ic->ic_wcl_mac_reconfig, joinPending, scanPending);
     // Applying a private MAC restarts firmware asynchronously. WCL can issue
     // the association before that restart has completed; keep one request
     // until the HAL reports READY rather than making the user retry it.
@@ -437,10 +502,12 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         explicit_bzero(&join, sizeof(join));
         joinDeferred = joinPending = true;
         joinTimer->setTimeoutMS(30000);
+        WCLLog("join deferred until firmware restart for MAC change completes");
         return kIOReturnSuccess;
     }
     if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending || scanPending) {
         explicit_bzero(&join, sizeof(join));
+        WCLLog("join refused: %s", !supported ? "unsupported auth" : "busy/not running");
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
     }
     if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
@@ -539,6 +606,7 @@ void AirportItlwmSkywalkInterface::resumeWCLJoin()
 {
     if (!joinDeferred || wclStopping)
         return;
+    WCLLog("resuming deferred join after %llu ms", wclNowMs() - wclJoinStartMs);
     AirportWCL::JoinRequest join = deferredJoin;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
     joinDeferred = joinPending = false;
@@ -555,6 +623,9 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
 {
     if (!joinPending)
         return;
+    WCLLog("join finished status=%u reason=%u driver=0x%x after %llu ms (state=%d)",
+           status, reason, driverStatus, wclNowMs() - wclJoinStartMs,
+           fHalService->get80211Controller()->ic_state);
     AirportWCL::ConnectionEvent event = {};
     event.status = status;
     event.reason = reason;
@@ -623,6 +694,10 @@ void AirportItlwmSkywalkInterface::handleWCLLink(bool up)
 {
     if (wclStopping)
         return;
+    if (joinPending || up != portAuthorized)
+        WCLLog("link %s (key handshake %s) at %llu ms, first beacon=%d",
+               up ? "up" : "down", up ? "done" : "lost", wclNowMs() - wclJoinStartMs,
+               firstBeaconNotified);
     portAuthorized = up;
     if (!up && wclLinkIndicated) {
         AirportWCL::LinkStatusEvent event = {};
@@ -650,6 +725,12 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
         return;
     }
     ieee80211com *ic = fHalService->get80211Controller();
+    if (code == IEEE80211_EVT_DRIVER_RESET_BEGIN || code == IEEE80211_EVT_DRIVER_READY ||
+        code == IEEE80211_EVT_DRIVER_STOPPED)
+        WCLLog("driver %s (macreconfig=%d joinPending=%d deferred=%d)",
+               code == IEEE80211_EVT_DRIVER_READY ? "ready" :
+               code == IEEE80211_EVT_DRIVER_STOPPED ? "stopped" : "reset begin",
+               ic->ic_wcl_mac_reconfig, joinPending, joinDeferred);
     switch (code) {
         case IEEE80211_EVT_COUNTRY_CODE_UPDATE:
             deferWCLCountryUpdate();
@@ -749,6 +830,8 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                 if (!wclBssValid)
                     break;
                 firstBeaconNotified = true;
+                WCLLog("first beacon after assoc at %llu ms, port authorized=%d",
+                       wclNowMs() - wclJoinStartMs, portAuthorized);
                 AirportWCL::LinkStatusEvent link = {};
                 memcpy(link.bssid, joinBSSID, sizeof(link.bssid));
                 link.up = 1;
@@ -778,6 +861,11 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                 memcpy(event.bssid, joinBSSID, 6);
                 event.driverStatus = event.status ? kIOReturnError : kIOReturnSuccess;
                 assocNotified = !event.status;
+                WCLLog("assoc done status=%u at %llu ms (rsn akms=0x%x cipher=0x%x mfp=%d)",
+                       event.status, wclNowMs() - wclJoinStartMs,
+                       ic->ic_bss ? ic->ic_bss->ni_rsnakms : 0,
+                       ic->ic_bss ? ic->ic_bss->ni_rsncipher : 0,
+                       ic->ic_bss ? !!(ic->ic_bss->ni_flags & IEEE80211_NODE_MFP) : 0);
                 instance->postMessage(this, AirportWCL::AssocComplete, &event, sizeof(event), true);
                 if (event.status)
                     finishWCLJoin(event.status, 0, kIOReturnError);
@@ -790,6 +878,8 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             event.reason = ic->ic_deauth_reason;
             if (ic->ic_bss)
                 memcpy(event.bssid, ic->ic_bss->ni_bssid, 6);
+            WCLLog("deauth/disassoc reason=%u joinPending=%d at %llu ms", event.reason,
+                   joinPending, wclNowMs() - wclJoinStartMs);
             instance->postMessage(this, AirportWCL::Deauth, &event, sizeof(event), true);
             finishWCLJoin(1, event.reason, kIOReturnOffline);
             break;
