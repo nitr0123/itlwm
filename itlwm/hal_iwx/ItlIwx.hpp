@@ -423,6 +423,7 @@ public:
     static int    iwx_bgscan(struct ieee80211com *);
 #ifdef AIRPORT_WCL
     static void   iwx_wcl_expedite_join(struct ieee80211com *);
+    bool          iwx_wcl_scan_notif(struct iwx_softc *, bool, uint8_t);
 #endif
     int    iwx_umac_scan_abort(struct iwx_softc *);
     int    iwx_scan_abort(struct iwx_softc *);

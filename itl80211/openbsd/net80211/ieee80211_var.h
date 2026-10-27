@@ -451,6 +451,8 @@ struct ieee80211com {
     uint32_t ic_wcl_scan_away_time_ms;
     /* Channel of the BSS a WCL join targets (0 = scan everything). */
     uint8_t ic_wcl_join_channel;
+    /* Join channel the last foreground scan was limited to (0 = all). */
+    uint8_t ic_wcl_scanned_join_channel;
     uint64_t ic_wcl_join_start_ms;
     /* Optional HAL hook: abort a running full scan so a join can rescan. */
     void (*ic_wcl_expedite_join)(struct ieee80211com *);

@@ -1457,10 +1457,28 @@ ieee80211_end_scan(struct _ifnet *ifp)
         DPRINTF(("no scan candidate\n"));
     notfound:
 #ifdef AIRPORT_WCL
-        WCL_TRACE(ic, "scan found no matching BSS (join channel %u)", ic->ic_wcl_join_channel);
-        /* The target was not on its advertised channel: scan everything next. */
-        if (!bgscan && ic->ic_wcl_join_requested)
-            ic->ic_wcl_join_channel = 0;
+        if (!bgscan && ic->ic_wcl_join_requested) {
+            struct ieee80211_node *n, *target = NULL;
+            int count = 0;
+            RB_FOREACH(n, ieee80211_tree, &ic->ic_tree)
+                count++;
+            if (ic->ic_flags & IEEE80211_F_DESBSSID)
+                target = ieee80211_find_node(ic, ic->ic_des_bssid);
+            WCL_TRACE(ic, "no matching BSS: scanned join channel %u, %d nodes, target %s "
+                      "(ch %u rssi %d fails %d match 0x%x) mode %d",
+                      ic->ic_wcl_scanned_join_channel, count, target ? "cached" : "absent",
+                      target ? ieee80211_chan2ieee(ic, target->ni_chan) : 0,
+                      target ? target->ni_rssi : 0, target ? target->ni_fails : 0,
+                      target ? ieee80211_match_bss(ic, target, 0) : 0, ic->ic_curmode);
+            /*
+             * Only a scan that was limited to the join channel and missed
+             * the BSS widens the next scan; completions of earlier full
+             * scans must not.
+             */
+            if (ic->ic_wcl_scanned_join_channel)
+                ic->ic_wcl_join_channel = 0;
+            ic->ic_wcl_scanned_join_channel = 0;
+        }
 #endif
         
 #ifndef IEEE80211_STA_ONLY
@@ -1483,6 +1501,19 @@ ieee80211_end_scan(struct _ifnet *ifp)
             if (ieee80211_next_mode(ifp) == IEEE80211_MODE_AUTO ||
                 (ic->ic_caps & IEEE80211_C_SCANALLBAND))
                 ic->ic_scan_count++;
+#ifdef AIRPORT_WCL
+            /*
+             * Hardware that scans all bands at once gains nothing from mode
+             * cycling, and a non-AUTO ic_curmode makes ieee80211_match_bss()
+             * reject BSSes of other bands (channel/basic-rate checks) for a
+             * pending WCL join. Go back to AUTO when the media allows it.
+             */
+            if (ic->ic_wcl_join_requested && (ic->ic_caps & IEEE80211_C_SCANALLBAND) &&
+                IFM_MODE(ic->ic_media.ifm_cur->ifm_media) == IFM_AUTO) {
+                ieee80211_setmode(ic, IEEE80211_MODE_AUTO);
+                ieee80211_reset_scan(ifp);
+            }
+#endif
             
             ieee80211_next_scan(ifp);
         }

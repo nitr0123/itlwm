@@ -7718,8 +7718,13 @@ iwx_umac_scan_fill_channels(struct iwx_softc *sc,
         nchan++;
     }
     
+#ifdef AIRPORT_WCL
+    /* Remember whether this scan was limited to a join's channel. */
+    ic->ic_wcl_scanned_join_channel = (ic->ic_wcl_join_requested && !ic->ic_wcl_scan_requested &&
+                                       !bgscan) ? ic->ic_wcl_join_channel : 0;
+#endif
     WCL_TRACE(ic, "scan request: %u channel(s), join channel %u, bg=%d", nchan,
-              ic->ic_wcl_scan_requested ? 0 : ic->ic_wcl_join_channel, bgscan);
+              ic->ic_wcl_scanned_join_channel, bgscan);
     return nchan;
 }
 
@@ -10301,19 +10306,8 @@ iwx_endscan(struct iwx_softc *sc)
 //        XYLog("%s scan_result ssid=%s, bssid=%s, ni_rsnciphers=%d, ni_rsncipher=%d, ni_rsngroupmgmtcipher=%d, ni_rsngroupcipher=%d, ni_rssi=%d,  ni_capinfo=%d, ni_intval=%d, ni_rsnakms=%d, ni_supported_rsnakms=%d, ni_rsnprotos=%d, ni_supported_rsnprotos=%d, ni_rstamp=%d\n", __FUNCTION__, ni->ni_essid, ether_sprintf(ni->ni_bssid), ni->ni_rsnciphers, ni->ni_rsncipher, ni->ni_rsngroupmgmtcipher, ni->ni_rsngroupcipher, ni->ni_rssi, ni->ni_capinfo, ni->ni_intval, ni->ni_rsnakms, ni->ni_supported_rsnakms, ni->ni_rsnprotos, ni->ni_supported_rsnprotos, ni->ni_rstamp);
 //    }
     
-    if ((sc->sc_flags & (IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN)) == 0) {
-#ifdef AIRPORT_WCL
-        /* Completion of a scan aborted for a WCL join: start the join scan now. */
-        if (sc->sc_wcl_rescan_after_abort) {
-            sc->sc_wcl_rescan_after_abort = false;
-            if (ic->ic_state == IEEE80211_S_SCAN && ic->ic_wcl_join_requested) {
-                WCL_TRACE(ic, "aborted scan completed, starting join scan");
-                ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
-            }
-        }
-#endif
+    if ((sc->sc_flags & (IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN)) == 0)
         return;
-    }
     
     sc->sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
     WCL_TRACE(ic, "scan complete");
@@ -10325,8 +10319,11 @@ iwx_endscan(struct iwx_softc *sc)
  * A WCL join arrived while a full foreground scan (e.g. the one iwx_init
  * starts after a firmware restart) is running. That scan visits every 2.4 and
  * 5 GHz channel, DFS ones passively, and takes ~7 s, most of airportd's 10 s
- * association budget. Abort it; iwx_endscan() starts the join scan, limited to
- * the target channel, once the firmware confirms the abort.
+ * association budget. Ask the firmware to abort it but keep IWX_FLAG_SCANNING
+ * set: the scan is only over when the firmware's SCAN_COMPLETE arrives (all
+ * scans use uid 0, so completions can't be told apart otherwise).
+ * iwx_wcl_scan_notif() then evaluates the node table: macOS's BSS is joined
+ * from the cache if present, else the join scan runs on its channel only.
  */
 void ItlIwx::
 iwx_wcl_expedite_join(struct ieee80211com *ic)
@@ -10341,13 +10338,38 @@ iwx_wcl_expedite_join(struct ieee80211com *ic)
             }, ic);
         return;
     }
-    if (ic->ic_state != IEEE80211_S_SCAN ||
+    if (ic->ic_state != IEEE80211_S_SCAN || sc->sc_wcl_abort_pending ||
         (sc->sc_flags & (IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN)) != IWX_FLAG_SCANNING)
         return;
-    int err = that->iwx_scan_abort(sc);
+    /* Set before sending: the completion may be handled while we wait. */
+    sc->sc_wcl_abort_pending = true;
+    int err = that->iwx_umac_scan_abort(sc);
     WCL_TRACE(ic, "aborting running full scan for join (err %d)", err);
-    if (err == 0)
-        sc->sc_wcl_rescan_after_abort = true;
+    if (err)
+        sc->sc_wcl_abort_pending = false;
+}
+
+/*
+ * Filter UMAC scan notifications. Returns true when the notification was
+ * consumed and iwx_endscan() must not run for it.
+ */
+bool ItlIwx::
+iwx_wcl_scan_notif(struct iwx_softc *sc, bool complete, uint8_t status)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    if (sc->sc_wcl_abort_pending) {
+        if (!complete)
+            return true;    /* iteration end of the scan being aborted */
+        sc->sc_wcl_abort_pending = false;
+        sc->sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
+        WCL_TRACE(ic, "aborted scan finished (status %u), checking cached BSSes", status);
+        if (ic->ic_state == IEEE80211_S_SCAN)
+            ieee80211_end_scan(&ic->ic_if);
+        return true;
+    }
+    if (complete && status == IWX_SCAN_OFFLOAD_ABORTED)
+        WCL_TRACE(ic, "scan completion with status aborted (not ours)");
+    return false;
 }
 #endif
 
@@ -11026,6 +11048,9 @@ iwx_stop(struct _ifnet *ifp)
     }
     
     sc->sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
+#ifdef AIRPORT_WCL
+    sc->sc_wcl_abort_pending = false;
+#endif
     sc->sc_flags &= ~IWX_FLAG_MAC_ACTIVE;
     sc->sc_flags &= ~IWX_FLAG_BINDING_ACTIVE;
     sc->sc_flags &= ~IWX_FLAG_STA_ACTIVE;
@@ -11699,6 +11724,10 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
             case IWX_SCAN_COMPLETE_UMAC: {
                 struct iwx_umac_scan_complete *notif;
                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_umac_scan_complete *);
+#ifdef AIRPORT_WCL
+                if (iwx_wcl_scan_notif(sc, true, notif->status))
+                    break;
+#endif
                 iwx_endscan(sc);
                 break;
             }
@@ -11706,6 +11735,10 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
             case IWX_SCAN_ITERATION_COMPLETE_UMAC: {
                 struct iwx_umac_scan_iter_complete_notif *notif;
                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_umac_scan_iter_complete_notif *);
+#ifdef AIRPORT_WCL
+                if (iwx_wcl_scan_notif(sc, false, 0))
+                    break;
+#endif
                 iwx_endscan(sc);
                 break;
             }
